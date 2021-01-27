@@ -29,7 +29,8 @@ TEST_MODULES = \
     test_lazyfree.so \
     timer.so \
     defragtest.so \
-    stream.so
+    stream.so \
+    list.so
 
 
 .PHONY: all
