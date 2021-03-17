@@ -59,15 +59,15 @@
  * +--------------------+
  * | dict               |
  * |--------------------|   +--------------------+   +--------------------+
- * | children | bitmap ---->| children | bitmap ---->| key      | value   |
- * | size               |   | key      | value   |   | ...      | ...     |
- * | dictType           |   | key      | value   |   +--------------------+
- * | privdata           |   | key      | value   |
- * +--------------------+   | key      | value   |   +--------------------+
- *                          | children | bitmap ---->| key      | value   |
- *                          | key      | value   |   | children | bitmap --->..
- *                          | ...      | ...     |   | value    | key     |
- *                          +--------------------+   | ...      | ...     |
+ * | bitmap  | children---->| bitmap  | children---->| key     | value    |
+ * | size               |   | key     | value    |   | ...     | ...      |
+ * | dictType           |   | key     | value    |   +--------------------+
+ * | privdata           |   | key     | value    |
+ * +--------------------+   | key     | value    |   +--------------------+
+ *                          | bitmap  | children---->| key     | value    |
+ *                          | key     | value    |   | bitmap  | children--->..
+ *                          | ...     | ...      |   | value   | key      |
+ *                          +--------------------+   | ...     | ...      |
  *                                                   +--------------------+
  *
  * In each level, 5 bits of the hash is used as an index into the child nodes.
@@ -86,10 +86,10 @@
  * we look at the 2nd child.
  *
  * children  = +-------------------+
- *             | key      | value  |
- *             | key      | value  | <-- The 2nd child is a key-value entry. If
- *             | children | bitmap |     the key matches our key, then it's our
- *             | ...      | ...    |     key. Otherwise, the dict doesn't
+ *             | key    | value    |
+ *             | key    | value    | <-- The 2nd child is a key-value entry. If
+ *             | bitmap | children |     the key matches our key, then it's our
+ *             | ...    | ...      |     key. Otherwise, the dict doesn't
  *             +-------------------+     contain our key.
  *
  * If, instead, our child is a sub node (a children-bitmap pair), we use the
@@ -103,6 +103,22 @@
  * Despite the incremental rehashing, allocating and freeing very large
  * continous memory is expensive. The memory usage was also higher than for the
  * HAMT (TO BE VERIFIED). */
+
+/*##########################################################################\
+|#/                                                                       \#|
+|#|    DEBUGGING                                                          |#|
+|#|                                                                       |#|
+
+cd src
+make OPTIMIZATION="-O0" REDIS_CFLAGS=-DREDIS_TEST -j5 noopt
+make BUILD_TLS=1 OPTIMIZATION="-O0" REDIS_CFLAGS=-DREDIS_TEST \
+     CFLAGS=-fsanitize=address \
+     "LDFLAGS=-static-libasan -fsanitize=address" -j5 noopt
+gdb --args ./redis-server test dict
+
+|#|                                                                       |#|
+|#\_______________________________________________________________________/#|
+\##########################################################################*/
 
 /* -------------------------- globals --------------------------------------- */
 
@@ -154,7 +170,7 @@ uint64_t dictGenCaseHashFunction(const unsigned char *buf, int len) {
 #ifdef USE_BUILTIN_POPCOUNT
 # define dict_popcount(x)  __builtin_popcount((unsigned int)(x))
 #else
-/* Population count (the number of 1s in a binary number), SWAR algorithm. */
+/* Population count (the number of 1s in a binary number), parallel summing. */
 int dict_popcount(uint32_t x) {
     x -= ((x >> 1) & 0x55555555);
     x  = ((x >> 2) & 0x33333333) + (x & 0x33333333);
@@ -164,25 +180,17 @@ int dict_popcount(uint32_t x) {
 }
 #endif
 
-/* The dictEntry.key and dictSubNode.children share space in the union. The two
-   least significant bits determine if it's an entry or a sub-node. Keys are
-   aligned on at least 4 bytes (2-bit LSB pattern 00), except sds strings, which
-   have an odd-sized (1, 3, 5 or 9 bytes) header before the pointer, so sds
-   pointers have LSB = 1. We use the 2-bit pattern 10 to tag/mask the children
-   pointers. */
-#define is_childptr(ptr) (((intptr_t)(ptr) & 3) == 2)
-#define mask_childptr(ptr) ((union dictNode*)(((intptr_t)(ptr)) | 2))
-#define unmask_childptr(ptr) ((union dictNode*)(((intptr_t)(ptr)) & ~2))
-#define is_entry(ptr) (!is_childptr((ptr)->sub.children))
-
 /* The 5 bits used at level N to index into the children. */
-#define bitindex_at_level(h, lvl) (((h) >> (5 * (lvl))) & 0x1f)
+#define bitindex_at_level(h, lvl) ((int)((h) >> (5 * (lvl))) & 0x1f)
 
-/* Sets the 5 bits corresponding at a given level to bitindex (0-31) */
-static void setBitindexAtLevel(uint64_t *path, int level, int bitindex) {
-    *path &= ~(0x1f << (5 * level)); /* clear bits */
-    *path |= (bitindex << (5 * level)); /* set bits */
-}
+/* Check if bit 'bit' is set in 'bitmap' */
+#define bit_is_set(bitmap, bit) (((bitmap) >> (bit)) & 1)
+
+#define child_exists(node, bit) bit_is_set((node)->bitmap, bit)
+#define child_is_entry(node, bit) bit_is_set((node)->leafmap, bit)
+
+/* The index in the children array is the number of children before this one */
+#define child_index(node, bit) dict_popcount((node)->bitmap >> (bit) >> 1)
 
 /* If we'd want to use the MSB of the hash first...
  * For level 0, it's the first 5 bits of 64. For level N, it's the 5 bits
@@ -237,6 +245,67 @@ int dictAdd(dict *d, void *key, void *val)
     return DICT_OK;
 }
 
+void dictDumpSub(dictSubNode *node, int level) {
+    for (int childbit = 0; childbit < 32; childbit++) {
+        if (!child_exists(node, childbit)) continue;
+        int childindex = child_index(node, childbit);
+        if (child_is_entry(node, childbit)) {
+            dictEntry *entry = &node->children[childindex].entry;
+            printf("%*s%02d \"%s\"\n", level*3, "", childbit, (char*)entry->key);
+        } else {
+            printf("%*s%02d\n", level*3, "", childbit);
+            dictDumpSub(&node->children[childindex].sub, level + 1);
+        }
+    }
+}
+
+/* Prints a dict as a tree with node indices. Keys must be strings. */
+void dictDump(dict *d) {
+    if (d->size == 0)
+        printf("00 (empty)\n");
+    else if (d->size == 1)
+        printf("00 \"%s\"\n", (char*)d->root.entry.key);
+    else
+        dictDumpSub(&d->root.sub, 0);
+}
+
+/* Prints a cursor as a path of 5-bit indices into the tree. */
+void dumpCursor(uint64_t c) {
+    printf("cursor:");
+    while (c) {
+        printf("/%ld", (c & 0x1f));
+        c = c >> 5;
+    }
+}
+
+/* Prints all keys on a single line using an iterator. Keys are assumed to be
+ * strings. */
+void dictPrintAll(dict *d) {
+    dictIterator iter;
+    dictInitIterator(&iter, d, 0);
+    printf("Dict keys:");
+    for (;;) {
+        dictEntry *e = dictNext(&iter);
+        if (e == NULL) break;
+        printf(" %s", (char*)e->key);
+    }
+    printf("\n");
+}
+
+/* In-place converts an entry into a subnode. The old entry is copied and
+ * becomes the only child of the subnode. When using this function, don't forget
+ * to flag the node as a subnode in the parent's leafmap. */
+static void _dictWrapEntryInSubnode(dict *d, union dictNode *node, int level) {
+    union dictNode *children = zmalloc(sizeof(union dictNode) * 1);
+    children[0].entry = node->entry; /* copy entry */
+    uint64_t hash = dictHashKey(d, node->entry.key);
+    int childbit = bitindex_at_level(hash, level);
+    /* Reinterpret the node as a subnode and add children. */
+    node->sub.children = children;
+    node->sub.bitmap = (1U << childbit);
+    node->sub.leafmap = (1U << childbit);
+}
+
 /* Low level add or find:
  * This function adds the entry but instead of setting a value returns the
  * dictEntry structure to the user, that will make sure to fill the value
@@ -256,71 +325,69 @@ int dictAdd(dict *d, void *key, void *val)
  * If key was added, the hash entry is returned to be manipulated by the caller.
  */
 dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
-    /* Keys are not allowed to have the 2-bit LSB pattern 10, since this is how
-       we tag internal children pointers. */
-    assert(!is_childptr(key));
-
     if (d->size == 0) {
         d->root.entry.key = key;
         d->size = 1;
         return &d->root.entry;
     }
-
+    if (d->size == 1) {
+        /* Root is an entry. */
+        if (dictCompareKeys(d, key, d->root.entry.key)) {
+            *existing = &d->root.entry;
+            return NULL;
+        }
+        /* Convert the root to a subnode. */
+        _dictWrapEntryInSubnode(d, &d->root, 0);
+    }
     uint64_t hash = dictHashKey(d, key);
+    dictSubNode *node = &d->root.sub;
     int level = 0;
-    union dictNode *node = &d->root;
     for (;;) {
-        if (is_childptr(node->sub.children)) {
-            /* It's an internal node. */
-            union dictNode *children = unmask_childptr(node->sub.children);
-            uint32_t bitmap = node->sub.bitmap;
-            /* Use 5 bits of the hash as an index into one of 32 possible
-               children. The child exists if the bit at bitindex is set. */
-            int bitindex = bitindex_at_level(hash, level);
-            uint32_t shifted = bitmap >> bitindex;
-            if (shifted & 1) {
-                /* Child exists. The position of the child is the number of
-                 * 1-bits to the left of this bit in the bitmap. */
-                int childindex = dict_popcount(shifted >> 1);
-                node = &children[childindex];
-                if (level * 5 >= 64) {
-                    /* We've used up all hash bits. Use 2ndary hash function. */
-                    assert(false); /* TODO */
+        /* Use 5 bits of the hash as an index into one of 32 possible
+         * children. The child exists if the bit at childbit is set. */
+        int childbit = bitindex_at_level(hash, level);
+        int childindex = child_index(node, childbit);
+        if (child_exists(node, childbit)) {
+            if (child_is_entry(node, childbit)) {
+                dictEntry *entry = &node->children[childindex].entry;
+                if (dictCompareKeys(d, key, entry->key)) {
+                    *existing = entry;
+                    return NULL;
                 }
-                level++;
-            } else {
-                /* Child doesn't exist. Let's make space for our entry here. */
-                int childindex = dict_popcount(shifted >> 1);
-                int numchildren = dict_popcount(bitmap);
-                int numafter = numchildren - childindex;
-                children = zrealloc(children,
-                                    sizeof(union dictNode) * ++numchildren);
-                memmove(&children[childindex + 1], &children[childindex],
-                        sizeof(union dictNode) * numafter);
-                children[childindex].entry.key = key;
-                node->sub.children = mask_childptr(children);
-                node->sub.bitmap |= (1 << bitindex);
-                d->size++;
-                return &children[childindex].entry;
+                /* There's another entry at this position. We need to wrap it in
+                 * a subnode and then add our entry in there. */
+
+                if ((level + 1) * 5 >= 64) {
+                    /* Max depth reached; no more hash bits available. TODO: Use
+                     * secondary hash function or a duplicate list (a flat array
+                     * on the deepest level). */
+                    assert(false);
+                }
+
+                /* Convert entry to subnode and clear its leaf flag. */
+                _dictWrapEntryInSubnode(d, &node->children[childindex], level+1);
+                node->leafmap &= ~(1U << childbit);
+                assert(!child_is_entry(node, childbit));
             }
+            /* The child is a subnode. Loop to add our new key inside it. */
+            node = &node->children[childindex].sub;
+            level++;
         } else {
-            /* It's a leaf, i.e. a dictEntry. */
-            if (dictCompareKeys(d, key, node->entry.key)) {
-                *existing = &node->entry;
-                return NULL;
-            }
-            /* There's another entry at this position. We need to wrap this one
-               in a sub node (and then add our entry in there). Copy the
-               existing entry into a new children array and then convert the
-               current node to an internal node. */
-            uint64_t other_hash = dictHashKey(d, node->entry.key);
-            int other_bitindex = bitindex_at_level(other_hash, level);
-            union dictNode *children = zmalloc(sizeof(union dictNode) * 1);
-            children[0] = *node;
-            node->sub.children = mask_childptr(children);
-            node->sub.bitmap = (1 << other_bitindex);
-            /* TODO (optimization): If bitindex != other_bitindex, then add our
-               entry here directly, either before or after the other entry. */
+            /* Child doesn't exist. Let's make space for our entry here. */
+            int numchildren = dict_popcount(node->bitmap);
+            int numafter = numchildren - childindex;
+            numchildren++;
+            node->children = zrealloc(node->children,
+                                      sizeof(union dictNode) * numchildren);
+            memmove(&node->children[childindex + 1],
+                    &node->children[childindex],
+                    sizeof(union dictNode) * numafter);
+            node->children[childindex].entry.key = key;
+            node->children[childindex].entry.v.u64 = 0; /* clear old memory */
+            node->bitmap |= (1U << childbit);
+            node->leafmap |= (1U << childbit);
+            d->size++;
+            return &node->children[childindex].entry;
         }
     }
 }
@@ -328,39 +395,34 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
 /* Returns a pointer to an entry or NULL if the key isn't found in the dict. */
 dictEntry *dictFind(dict *d, const void *key) {
     if (d->size == 0) return NULL; /* dict is empty */
-    uint64_t hash = dictHashKey(d, key);
-    int level = 0;
-    union dictNode *node = &d->root;
-    for (;;) {
-        if (is_childptr(node->sub.children)) {
-            /* It's an internal node. */
-            union dictNode *children = unmask_childptr(node->sub.children);
-            uint32_t bitmap = node->sub.bitmap;
-            /* Use 5 bits of the hash as an index into one of 32 possible
-               children. The child exists if the bit at bitindex is set. */
-            int bitindex = bitindex_at_level(hash, level);
-            uint32_t shifted = bitmap >> bitindex;
-            if (shifted & 1) {
-                /* Child exists. The position of the child is the number of
-                 * 1-bits to the left of this bit in the bitmap. */
-                int childpos = dict_popcount(shifted >> 1);
-                node = &children[childpos];
-                if (level * 5 >= 64) {
-                    /* We've used up all hash bits. Use 2ndary hash function. */
-                    assert(false); /* TODO */
-                }
-                level++;
-            } else {
-                /* Child doesn't exist. */
-                return NULL;
-            }
-        } else {
-            /* It's a leaf, i.e. a dictEntry. */
-            if (dictCompareKeys(d, key, node->entry.key)) {
-                return &node->entry;
-            }
-            /* There's another entry at this position. */
+    if (d->size == 1) {
+        /* Root is an entry. */
+        dictEntry *entry = &d->root.entry;
+        if (dictCompareKeys(d, key, entry->key))
+            return entry;
+        else
             return NULL;
+    }
+    uint64_t hash = dictHashKey(d, key);
+    dictSubNode *node = &d->root.sub;
+    int level = 0;
+    for (;;) {
+        /* Use 5 bits of the hash as an index into one of 32 possible
+           children. The child exists if the bit at childbit is set. */
+        int childbit = bitindex_at_level(hash, level);
+        if (!child_exists(node, childbit))
+            return NULL;
+        int childindex = child_index(node, childbit);
+        if (child_is_entry(node, childbit)) {
+            dictEntry *entry = &node->children[childindex].entry;
+            if (dictCompareKeys(d, key, entry->key))
+                return entry;
+            else
+                return NULL;
+        } else {
+            /* It's a subnode */
+            node = &node->children[childindex].sub;
+            level++;
         }
     }
 }
@@ -406,63 +468,65 @@ dictEntry *dictAddOrFind(dict *d, void *key) {
     return entry ? entry : existing;
 }
 
-/* Removes an entry from a node. Returns 1 if the key was found and 0 otherwise.
- * The 'deleted' entry is filled with the key and value from the deleted entry.
- * This is a recursive helper for dictGenericDelete(). */
-int dictDeleteFromNode(dict *d, union dictNode *node, int level, uint64_t hash,
+/* Removes an entry from a subnode. Returns 1 if the key was found and 0
+ * otherwise. The 'deleted' entry is filled with the key and value from the
+ * deleted entry. This is a recursive helper for dictGenericDelete(). */
+int dictDeleteFromNode(dict *d, dictSubNode *node, int level, uint64_t hash,
                        const void *key, dictEntry *deleted) {
-    assert(is_childptr(node->sub.children));
-    union dictNode *children = unmask_childptr(node->sub.children);
-    uint32_t bitmap = node->sub.bitmap;
     /* Use 5 bits of the hash as an index into one of 32 possible
-       children. The child exists if the bit at bitindex is set. */
-    int bitindex = bitindex_at_level(hash, level);
-    uint32_t shifted = bitmap >> bitindex;
-    if (!(shifted & 1))
-        return 0; /* Child doesn't exist. */
+       children. The child exists if the bit at childbit is set. */
+    int childbit = bitindex_at_level(hash, level);
+    if (!child_exists(node, childbit))
+        return 0;
 
-    /* The child index is the number of 1-bits to the left of this bit. */
-    int childindex = dict_popcount(shifted >> 1);
-    union dictNode *child = &children[childindex];
-    if (is_entry(child)) {
-        if (!dictCompareKeys(d, key, child->entry.key))
+    int childindex = child_index(node, childbit);
+    if (child_is_entry(node, childbit)) {
+        dictEntry *entry = &node->children[childindex].entry;
+        if (!dictCompareKeys(d, key, entry->key))
             return 0;
+
         /* It's a match. Fill 'deleted' and remove child from node. */
         if (deleted != NULL)
-            *deleted = child->entry;
-        int numchildren = dict_popcount(node->sub.bitmap);
+            *deleted = *entry;
+
+        int numchildren = dict_popcount(node->bitmap);
         int numafter = numchildren - childindex;
-        memmove(&children[childindex], &children[childindex + 1],
+        memmove(&node->children[childindex],
+                &node->children[childindex + 1],
                 sizeof(union dictNode) * numafter);
-        children = zrealloc(children, sizeof(union dictNode) * --numchildren);
-        node->sub.children = mask_childptr(children);
-        node->sub.bitmap &= ~(1 << bitindex);
-        if (numchildren > 1)
-            return 1; /* Fast path. No need to collapse children. */
-    } else {
-        /* It's a subnode. Delete it from the child node. */
-        if ((level + 1) * 5 >= 64) {
-            /* All hash bits used up. TODO: Use secondary hash function. */
-            assert(false);
-        }
-        if (!dictDeleteFromNode(d, child, level + 1, hash, key, deleted))
-            return 0; /* Not found in subtree. */
+        node->children = zrealloc(node->children,
+                                  sizeof(union dictNode) * --numchildren);
+        node->bitmap  &= ~(1U << childbit);
+        node->leafmap &= ~(1U << childbit);
+        return 1;
     }
 
-    /* If we're here, it means we have removed an entry. If the node has now
-     * only one child which is an entry, we need to collapse the child.
-     *
+    /* It's a subnode. Recursively delete from the subnode. */
+    if ((level + 1) * 5 >= 64) {
+        /* All hash bits used up. TODO: Use secondary hash function. */
+        assert(false);
+    }
+    dictSubNode *subnode = &node->children[childindex].sub;
+    if (!dictDeleteFromNode(d, subnode, level + 1, hash, key, deleted))
+        return 0; /* Not found in subtree. */
+
+    /* If we're here, it means we have removed an entry from the child. If the
+     * child has now only one child and it's an entry, we need to collapse the
+     * child.
      *                                ,--entry
      * Before delete:  node---child--<
      *                                `--entry
      *
-     * After delete:   node---child---entry
+     * After removal:  node---child---entry
      *
      * After collapse: node---entry
      */
-    if (dict_popcount(node->sub.bitmap) == 1 && is_entry(&children[0])) {
-        *node = children[0];
-        zfree(children);
+    if (dict_popcount(subnode->bitmap) == 1 &&
+        subnode->leafmap == subnode->bitmap) {
+        union dictNode *grandchildren = subnode->children;
+        node->children[childindex] = grandchildren[0]; /* copy */
+        node->leafmap |= (1U << childbit);
+        zfree(grandchildren);
     }
     return 1;
 }
@@ -473,8 +537,9 @@ int dictDeleteFromNode(dict *d, union dictNode *node, int level, uint64_t hash,
  * This is an helper function for dictDelete() and dictUnlink(). Please check
  * the top comment of those functions. */
 int dictGenericDelete(dict *d, const void *key, dictEntry *deleted) {
+    if (d->size == 0) return 0;
     if (d->size == 1) {
-        assert(is_entry(&d->root));
+        /* Root is an entry. */
         if (dictCompareKeys(d, key, d->root.entry.key)) {
             *deleted = d->root.entry;
             d->size = 0;
@@ -483,7 +548,19 @@ int dictGenericDelete(dict *d, const void *key, dictEntry *deleted) {
         return 0;
     }
     uint64_t hash = dictHashKey(d, key);
-    return dictDeleteFromNode(d, &d->root, 0, hash, key, deleted);
+    int found = dictDeleteFromNode(d, &d->root.sub, 0, hash, key, deleted);
+    if (found) {
+        d->size--;
+        if (d->size == 1) {
+            /* Collapse into root. */
+            assert(d->root.sub.bitmap == d->root.sub.leafmap);
+            assert(dict_popcount(d->root.sub.bitmap) == 1);
+            union dictNode *grandchildren = d->root.sub.children;
+            d->root.entry = grandchildren[0].entry; /* copy */
+            zfree(grandchildren);
+        }
+    }
+    return found;
 }
 
 /* Remove an element, returning DICT_OK on success or DICT_ERR if the
@@ -540,30 +617,35 @@ void dictFreeUnlinkedEntry(dict *d, dictEntry *he) {
     zfree(he);
 }
 
-/* Deletes the contents of a node. Returns counter after incrementing it with
- * the number of deleted elements. */
-int dictClearNode(dict *d, union dictNode *node, long counter,
+/* Deletes the contents of a subnode. Returns counter after incrementing it with
+ * the number of deleted elements. Calls progress indicator callback sometimes
+ * if provided. */
+int dictClearNode(dict *d, dictSubNode *node, long counter,
                   void(callback)(void *)) {
-    if (is_entry(node)) {
-        dictFreeKey(d, &node->entry);
-        dictFreeVal(d, &node->entry);
-        counter++;
-        if (callback && (counter & 65535) == 0)
-            callback(d->privdata);
-    } else {
-        int numchildren = dict_popcount(node->sub.bitmap);
-        union dictNode *children = unmask_childptr(node->sub.children);
-        for (int i = 0; i < numchildren; i++)
-            counter = dictClearNode(d, &children[i], counter, callback);
-        zfree(children);
+    for (int childbit = 0; childbit < 32; childbit++) {
+        if (child_exists(node, childbit)) {
+            int childindex = child_index(node, childbit);
+            if (child_is_entry(node, childbit)) {
+                dictEntry *entry = &node->children[childindex].entry;
+                dictFreeKey(d, entry);
+                dictFreeVal(d, entry);
+                counter++;
+                if (callback && (counter & 65535) == 0)
+                    callback(d->privdata);
+            } else {
+                dictSubNode *subnode = &node->children[childindex].sub;
+                counter = dictClearNode(d, subnode, counter, callback);
+            }
+        }
     }
+    zfree(node->children);
     return counter;
 }
 
 /* Clear & Release the hash table */
 void dictRelease(dict *d)
 {
-    if (d->size > 0) dictClearNode(d, &d->root, 0, NULL);
+    dictEmpty(d, NULL);
     zfree(d);
 }
 
@@ -585,33 +667,58 @@ dictIterator *dictGetSafeIterator(dict *d) {
     return dictGetIterator(d);
 }
 
-dictEntry *dictNextInNode(dictIterator *iter, union dictNode *node, int level) {
-    assert(is_childptr(node->sub.children));
-    union dictNode *children = unmask_childptr(node->sub.children);
-    int bitmap = node->sub.bitmap;
-    int bitindex = bitindex_at_level(iter->cursor, level);
-    while (bitindex < 32) {
-        int shifted = bitmap >> bitindex;
-        if (shifted & 1) {
-            /* Child exists. */
-            int childindex = dict_popcount(shifted >> 1);
-            union dictNode *child = &children[childindex];
-            if (is_entry(child)) {
+/* Forwards a cursor to the next index on the given level. The 5-bit group
+ * corresponding to the given level is incremented and all sublevels indexes are
+ * cleared. If the incremented 5-bit number overflows (i.e. if it reaches 32),
+ * it warps to 0 and the outer level's 5-bit group is incremented and overflow
+ * on this level is handle the same way. If level 0 overflows, 0 is returned
+ * (meaning that the root level has been fully scanned and there is no more to
+ * scan).
+ *
+ * If the 5-bit groups were be stored in order of significance, this would be a
+ * simple increment, but they are stored in reverse order, i.e. the most
+ * significant 5-bit group is the least significant 5 bits in the cursor. */
+static inline uint64_t incrCursorAtLevel(uint64_t cursor, int level) {
+    do {
+        int bits = (cursor >> (level * 5)) & 0x1f;
+        /* Clear this level and all more significant bits. */
+        cursor &= (1ULL << ((level) * 5)) - 1;
+        if (++bits < 32) {
+            assert((bits & ~0x1f) == 0);
+            cursor |= ((uint64_t)bits << (level * 5)); /* set bits this level */
+            break;
+        }
+        /* loop to increment the level above */
+    } while(--level >= 0);
+    return cursor;
+}
+
+dictEntry *dictNextInNode(dictIterator *iter, dictSubNode *node, int level) {
+    union dictNode *children = node->children;
+    int childbit = bitindex_at_level(iter->cursor, level);
+    while (1) {
+        if (child_exists(node, childbit)) {
+            int childindex = child_index(node, childbit);
+            if (child_is_entry(node, childbit)) {
                 /* Set start position for next time. */
-                setBitindexAtLevel(&iter->cursor, level, ++bitindex);
-                return &child->entry;
+                iter->cursor = incrCursorAtLevel(iter->cursor, level);
+                return &children[childindex].entry;
             } else {
                 /* Find next recurively. */
                 assert(level < 13); /* FIXME */
-                dictEntry *found = dictNextInNode(iter, child, level + 1);
+                dictSubNode *subnode = &children[childindex].sub;
+                dictEntry *found = dictNextInNode(iter, subnode, level + 1);
                 if (found) return found;
             }
         }
         /* No more entries within child. Skip to beginning of next child. */
-        setBitindexAtLevel(&iter->cursor, level, ++bitindex);
+        if (++childbit == 32) break;
+        iter->cursor &= ~(0x1fULL << (5*level));           /* clear all bits */
+        iter->cursor |= ((uint64_t)childbit << (5*level)); /* set bits */
     }
-    /* No more entries within node. Clear this and all sublevel indices. */
-    iter->cursor &= (1 << (5 * level)) - 1;
+    /* No more entries within node. Clear this and all sublevel indices. (At
+     * level 0 the mask is 0, at level 1 it is binary 11111, and so on.) */
+    iter->cursor &= (1U << (5 * level)) - 1;
     return NULL;
 }
 
@@ -624,7 +731,6 @@ dictEntry *dictNext(dictIterator *iter) {
         iter->cursor = 0;
         return NULL;
     case 1:
-        assert(is_entry(&iter->d->root));
         if (iter->cursor == 0) {
             iter->cursor++;
             return &iter->d->root.entry;
@@ -632,7 +738,7 @@ dictEntry *dictNext(dictIterator *iter) {
         iter->cursor = 0;
         return NULL;
     default:
-        return dictNextInNode(iter, &iter->d->root, 0);
+        return dictNextInNode(iter, &iter->d->root.sub, 0);
     }
 }
 
@@ -793,7 +899,13 @@ unsigned long dictScan(dict *d,
 }
 
 void dictEmpty(dict *d, void(callback)(void*)) {
-    if (d->size > 0) dictClearNode(d, &d->root, 0, callback);
+    if (d->size == 1) {
+        /* The root is an entry. */
+        dictFreeKey(d, &d->root.entry);
+        dictFreeVal(d, &d->root.entry);
+    } else if (d->size > 1) {
+        dictClearNode(d, &d->root.sub, 0, callback);
+    }
     d->size = 0;
 }
 

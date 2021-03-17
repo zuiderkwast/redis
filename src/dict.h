@@ -71,12 +71,15 @@ typedef struct dictType {
 
 union dictNode; /* leaf or internal node */
 
-/* Internal node */
+/* Internal node (same size as dictEntry) */
 typedef struct dictSubNode {
+    uint32_t bitmap;  /* exitence of potential child */
+    uint32_t leafmap; /* child is 1=leaf or 0=subnode */
     union dictNode *children;
-    uint32_t bitmap;
 } dictSubNode;
 
+/* The parent node contains a 'leafmap', which has a bit for each child to flag
+ * it as 1 = entry or 0 = subnode. */
 union dictNode {
     dictEntry entry;
     dictSubNode sub;
