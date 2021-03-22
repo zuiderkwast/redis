@@ -59,41 +59,47 @@
  * +--------------------+
  * | dict               |
  * |--------------------|   +--------------------+   +--------------------+
- * | bitmap  | children---->| bitmap  | children---->| key     | value    |
+ * | bitmaps | children---->| bitmaps | children---->| key     | value    |
  * | size               |   | key     | value    |   | ...     | ...      |
  * | dictType           |   | key     | value    |   +--------------------+
  * | privdata           |   | key     | value    |
  * +--------------------+   | key     | value    |   +--------------------+
- *                          | bitmap  | children---->| key     | value    |
- *                          | key     | value    |   | bitmap  | children--->..
+ *                          | bitmaps | children---->| key     | value    |
+ *                          | key     | value    |   | bitmaps | children--->..
  *                          | ...     | ...      |   | value   | key      |
  *                          +--------------------+   | ...     | ...      |
  *                                                   +--------------------+
  *
- * In each level, 5 bits of the hash is used as an index into the child nodes.
- * The bitmap indicates which of the children exist (1) and which don't (0).
+ * In each level, 5 bits of the hash is used as an index into the children. A
+ * bitmap indicates which of the children exist (1) and which don't (0). Whether
+ * the child is a leaf or a subnode is indicated by a second bitmap, "leafmap".
  *
- * hash(key) = 11010 10101 11001 01001 010101 10111 ...
- *             ^^^^^
- *              26
+ * hash(key) = 0010 10010 01011 00101 01001 10110 11101
+ * (64 bits)   10101 11001 01001 01101 10111 11010
+ *                                           ^^^^^
+ *                                             26
  *
  * bitmap    = 00100101 00000010 00010100 01100001
  * (level 0)        ^
- *                  bit 26 is set, so there is a child node or leaf
+ *                  bit 26 is 1, so there is a child node or leaf
+ *
+ * leafmap   = 00000100 00000010 00010000 01100000
+ * (level 0)        ^
+ *                  bit 26 is 1, so the child is a key-value entry
  *
  * The children array is compact and its length is equal to the number of 1s in
  * the bitmap. In the bitmap above, our bit is the 2nd 1-bit from the left, so
  * we look at the 2nd child.
  *
- * children  = +-------------------+
- *             | key    | value    |
- *             | key    | value    | <-- The 2nd child is a key-value entry. If
- *             | bitmap | children |     the key matches our key, then it's our
- *             | ...    | ...      |     key. Otherwise, the dict doesn't
- *             +-------------------+     contain our key.
+ * children  = +--------------------+
+ *             | bitmaps | children |
+ *             | key     | value    | <-- The 2nd child is a key-value entry. If
+ *             | bitmaps | children |     the key matches our key, then it's our
+ *             | ...     | ...      |     key. Otherwise, the dict doesn't
+ *             +--------------------+     contain our key.
  *
- * If, instead, our child is a sub node (a children-bitmap pair), we use the
- * next 5 bits from the hash to index into the next level children.
+ * If, instead, our child is a subnode, we use the next 5 bits from the hash to
+ * index into the next level of children.
  *
  * The HAMT is described in Phil Bagwell (2000). Ideal Hash Trees.
  * https://infoscience.epfl.ch/record/64398/files/idealhashtrees.pdf
@@ -325,6 +331,7 @@ static void _dictWrapEntryInSubnode(dict *d, union dictNode *node, int level) {
  * If key was added, the hash entry is returned to be manipulated by the caller.
  */
 dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
+    if (existing) *existing = NULL;
     if (d->size == 0) {
         d->root.entry.key = key;
         d->size = 1;
@@ -333,7 +340,7 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
     if (d->size == 1) {
         /* Root is an entry. */
         if (dictCompareKeys(d, key, d->root.entry.key)) {
-            *existing = &d->root.entry;
+            if (existing) *existing = &d->root.entry;
             return NULL;
         }
         /* Convert the root to a subnode. */
@@ -351,7 +358,7 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
             if (child_is_entry(node, childbit)) {
                 dictEntry *entry = &node->children[childindex].entry;
                 if (dictCompareKeys(d, key, entry->key)) {
-                    *existing = entry;
+                    if (existing) *existing = entry;
                     return NULL;
                 }
                 /* There's another entry at this position. We need to wrap it in
@@ -367,7 +374,6 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
                 /* Convert entry to subnode and clear its leaf flag. */
                 _dictWrapEntryInSubnode(d, &node->children[childindex], level+1);
                 node->leafmap &= ~(1U << childbit);
-                assert(!child_is_entry(node, childbit));
             }
             /* The child is a subnode. Loop to add our new key inside it. */
             node = &node->children[childindex].sub;
@@ -602,7 +608,7 @@ dictEntry *dictUnlink(dict *d, const void *key) {
         /* TODO: Rename dictGenericDelete() to dictUnlink() and refactor calls
            to it to get rid of the silly dup_entry. */
         dictEntry *dup_entry = zmalloc(sizeof(dictEntry));
-        memcpy(dup_entry, &entry, sizeof(dictEntry));
+        *dup_entry = entry;
         return dup_entry;
     }
     return NULL;
@@ -726,20 +732,23 @@ dictEntry *dictNextInNode(dictIterator *iter, dictSubNode *node, int level) {
  * elements in the dict while iterating. However, the entry pointer returned by
  * this function becomes invalid when adding or deleting any entries. */
 dictEntry *dictNext(dictIterator *iter) {
+    if (iter->d == NULL) return NULL;
+    dictEntry *entry = NULL;
     switch (iter->d->size) {
     case 0:
-        iter->cursor = 0;
-        return NULL;
+        break;
     case 1:
-        if (iter->cursor == 0) {
-            iter->cursor++;
-            return &iter->d->root.entry;
-        }
-        iter->cursor = 0;
-        return NULL;
+        if (iter->cursor++ == 0)
+            entry = &iter->d->root.entry;
+        break;
     default:
-        return dictNextInNode(iter, &iter->d->root.sub, 0);
+        entry = dictNextInNode(iter, &iter->d->root.sub, 0);
     }
+    if (entry == NULL) {
+        iter->d = NULL; /* Prevents it from warping. */
+        iter->cursor = 0;
+    }
+    return entry;
 }
 
 void dictInitIterator(dictIterator *iter, dict *d, uint64_t cursor) {
@@ -763,7 +772,7 @@ dictEntry *dictGetRandomKey(dict *d)
     dictEntry *entry = dictNext(&iter);
     if (entry == NULL) {
         /* warp and start from the beginning */
-        assert(iter.cursor == 0);
+        dictInitIterator(&iter, d, 0);
         entry = dictNext(&iter);
         assert(entry != NULL);
     }
@@ -801,7 +810,7 @@ unsigned int dictGetSomeKeys(dict *d, dictEntry **des, unsigned int count) {
         dictEntry *entry = dictNext(&iter);
         if (entry == NULL) {
             /* warp and start from the beginning */
-            assert(iter.cursor == 0);
+            dictInitIterator(&iter, d, 0);
             entry = dictNext(&iter);
             assert(entry != NULL);
         }
@@ -945,7 +954,8 @@ dictEntry **dictFindEntryRefByPtrAndHash(dict *d, const void *oldptr, uint64_t h
     DICT_NOTUSED(oldptr);
     DICT_NOTUSED(hash);
     if (dictSize(d) == 0) return NULL; /* dict is empty */
-    /* FIXME */
+    printf("FIXME dictFindEntryRefByPtrAndHash\n");
+    assert(false);
     return NULL;
 }
 
@@ -960,8 +970,11 @@ dictEntry **dictFindEntryRefByPtrAndHash(dict *d, const void *oldptr, uint64_t h
  * Section 3.5 "Space Used" refers to a HAMT with resizable root table.)
  */
 size_t dictEstimateMem(dict *d) {
+    /* Rough estimate: N + 1.5 * log32(N) */
     /* Log base conversion rule: log32(x) = log2(x) / log2(32) */
-    unsigned long numnodes = 1.5 * log2(d->size) / log2(32);
+    unsigned long numsubnodes = 1.5 * log2(d->size) / log2(32);
+    unsigned long numentries = d->size;
+    unsigned long numnodes = numentries + numsubnodes;
     return sizeof(dict) + sizeof(union dictNode) * numnodes;
 }
 
