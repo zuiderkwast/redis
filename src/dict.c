@@ -333,7 +333,7 @@ static void _dictWrapEntryInSubnode(dict *d, union dictNode *node, int level) {
 dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
     if (existing) *existing = NULL;
     if (d->size == 0) {
-        d->root.entry.key = key;
+        dictSetKey(d, &d->root.entry, key);
         d->size = 1;
         return &d->root.entry;
     }
@@ -368,7 +368,7 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
                     /* Max depth reached; no more hash bits available. TODO: Use
                      * secondary hash function or a duplicate list (a flat array
                      * on the deepest level). */
-                    assert(false);
+                    assert(0);
                 }
 
                 /* Convert entry to subnode and clear its leaf flag. */
@@ -382,14 +382,12 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
             /* Child doesn't exist. Let's make space for our entry here. */
             int numchildren = dict_popcount(node->bitmap);
             int numafter = numchildren - childindex;
-            numchildren++;
             node->children = zrealloc(node->children,
-                                      sizeof(union dictNode) * numchildren);
+                                      sizeof(union dictNode) * ++numchildren);
             memmove(&node->children[childindex + 1],
                     &node->children[childindex],
                     sizeof(union dictNode) * numafter);
-            node->children[childindex].entry.key = key;
-            node->children[childindex].entry.v.u64 = 0; /* clear old memory */
+            dictSetKey(d, &node->children[childindex].entry, key);
             node->bitmap |= (1U << childbit);
             node->leafmap |= (1U << childbit);
             d->size++;
@@ -477,8 +475,9 @@ dictEntry *dictAddOrFind(dict *d, void *key) {
 /* Removes an entry from a subnode. Returns 1 if the key was found and 0
  * otherwise. The 'deleted' entry is filled with the key and value from the
  * deleted entry. This is a recursive helper for dictGenericDelete(). */
-int dictDeleteFromNode(dict *d, dictSubNode *node, int level, uint64_t hash,
-                       const void *key, dictEntry *deleted) {
+static int dictDeleteFromNode(dict *d, dictSubNode *node, int level,
+                              uint64_t hash, const void *key,
+                              dictEntry *deleted) {
     /* Use 5 bits of the hash as an index into one of 32 possible
        children. The child exists if the bit at childbit is set. */
     int childbit = bitindex_at_level(hash, level);
@@ -491,12 +490,11 @@ int dictDeleteFromNode(dict *d, dictSubNode *node, int level, uint64_t hash,
         if (!dictCompareKeys(d, key, entry->key))
             return 0;
 
-        /* It's a match. Fill 'deleted' and remove child from node. */
-        if (deleted != NULL)
-            *deleted = *entry;
+        /* It's a match. Copy to 'deleted' and remove child from node. */
+        *deleted = *entry;
 
         int numchildren = dict_popcount(node->bitmap);
-        int numafter = numchildren - childindex;
+        int numafter = numchildren - childindex - 1;
         memmove(&node->children[childindex],
                 &node->children[childindex + 1],
                 sizeof(union dictNode) * numafter);
@@ -510,20 +508,20 @@ int dictDeleteFromNode(dict *d, dictSubNode *node, int level, uint64_t hash,
     /* It's a subnode. Recursively delete from the subnode. */
     if ((level + 1) * 5 >= 64) {
         /* All hash bits used up. TODO: Use secondary hash function. */
-        assert(false);
+        assert(0);
     }
     dictSubNode *subnode = &node->children[childindex].sub;
     if (!dictDeleteFromNode(d, subnode, level + 1, hash, key, deleted))
         return 0; /* Not found in subtree. */
 
-    /* If we're here, it means we have removed an entry from the child. If the
-     * child has now only one child and it's an entry, we need to collapse the
-     * child.
-     *                                ,--entry
-     * Before delete:  node---child--<
-     *                                `--entry
+    /* If we're here, it means we have removed an entry from the subnode. If the
+     * subnode has now only one child and it's an entry, we need to collapse the
+     * subnode.
+     *                                  ,--entry
+     * Before delete:  node---subnode--<
+     *                                  `--entry
      *
-     * After removal:  node---child---entry
+     * After removal:  node---subnode---entry
      *
      * After collapse: node---entry
      */
@@ -542,7 +540,7 @@ int dictDeleteFromNode(dict *d, dictSubNode *node, int level, uint64_t hash,
  *
  * This is an helper function for dictDelete() and dictUnlink(). Please check
  * the top comment of those functions. */
-int dictGenericDelete(dict *d, const void *key, dictEntry *deleted) {
+static int dictGenericDelete(dict *d, const void *key, dictEntry *deleted) {
     if (d->size == 0) return 0;
     if (d->size == 1) {
         /* Root is an entry. */
@@ -955,7 +953,7 @@ dictEntry **dictFindEntryRefByPtrAndHash(dict *d, const void *oldptr, uint64_t h
     DICT_NOTUSED(hash);
     if (dictSize(d) == 0) return NULL; /* dict is empty */
     printf("FIXME dictFindEntryRefByPtrAndHash\n");
-    assert(false);
+    assert(0);
     return NULL;
 }
 
