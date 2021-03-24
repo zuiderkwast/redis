@@ -198,11 +198,6 @@ int dict_popcount(uint32_t x) {
 /* The index in the children array is the number of children before this one */
 #define child_index(node, bit) dict_popcount((node)->bitmap >> (bit) >> 1)
 
-/* If we'd want to use the MSB of the hash first...
- * For level 0, it's the first 5 bits of 64. For level N, it's the 5 bits
- * after skipping the first N * 5 bits. */
-/* #define bitindex_at_level(h, lvl) (((h) >> (64 - 5 - (5 * lvl))) & 0x1f) */
-
 /* ----------------------------- API implementation ------------------------- */
 
 /* Create a new hash table */
@@ -251,57 +246,10 @@ int dictAdd(dict *d, void *key, void *val)
     return DICT_OK;
 }
 
-void dictDumpSub(dictSubNode *node, int level) {
-    for (int childbit = 0; childbit < 32; childbit++) {
-        if (!child_exists(node, childbit)) continue;
-        int childindex = child_index(node, childbit);
-        if (child_is_entry(node, childbit)) {
-            dictEntry *entry = &node->children[childindex].entry;
-            printf("%*s%02d \"%s\"\n", level*3, "", childbit, (char*)entry->key);
-        } else {
-            printf("%*s%02d\n", level*3, "", childbit);
-            dictDumpSub(&node->children[childindex].sub, level + 1);
-        }
-    }
-}
-
-/* Prints a dict as a tree with node indices. Keys must be strings. */
-void dictDump(dict *d) {
-    if (d->size == 0)
-        printf("00 (empty)\n");
-    else if (d->size == 1)
-        printf("00 \"%s\"\n", (char*)d->root.entry.key);
-    else
-        dictDumpSub(&d->root.sub, 0);
-}
-
-/* Prints a cursor as a path of 5-bit indices into the tree. */
-void dumpCursor(uint64_t c) {
-    printf("cursor:");
-    while (c) {
-        printf("/%ld", (c & 0x1f));
-        c = c >> 5;
-    }
-}
-
-/* Prints all keys on a single line using an iterator. Keys are assumed to be
- * strings. */
-void dictPrintAll(dict *d) {
-    dictIterator iter;
-    dictInitIterator(&iter, d, 0);
-    printf("Dict keys:");
-    for (;;) {
-        dictEntry *e = dictNext(&iter);
-        if (e == NULL) break;
-        printf(" %s", (char*)e->key);
-    }
-    printf("\n");
-}
-
 /* In-place converts an entry into a subnode. The old entry is copied and
  * becomes the only child of the subnode. When using this function, don't forget
  * to flag the node as a subnode in the parent's leafmap. */
-static void _dictWrapEntryInSubnode(dict *d, union dictNode *node, int level) {
+static void dictWrapEntryInSubnode(dict *d, union dictNode *node, int level) {
     union dictNode *children = zmalloc(sizeof(union dictNode) * 1);
     children[0].entry = node->entry; /* copy entry */
     uint64_t hash = dictHashKey(d, node->entry.key);
@@ -344,8 +292,9 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
             return NULL;
         }
         /* Convert the root to a subnode. */
-        _dictWrapEntryInSubnode(d, &d->root, 0);
+        dictWrapEntryInSubnode(d, &d->root, 0);
     }
+
     uint64_t hash = dictHashKey(d, key);
     dictSubNode *node = &d->root.sub;
     int level = 0;
@@ -354,32 +303,8 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
          * children. The child exists if the bit at childbit is set. */
         int childbit = bitindex_at_level(hash, level);
         int childindex = child_index(node, childbit);
-        if (child_exists(node, childbit)) {
-            if (child_is_entry(node, childbit)) {
-                dictEntry *entry = &node->children[childindex].entry;
-                if (dictCompareKeys(d, key, entry->key)) {
-                    if (existing) *existing = entry;
-                    return NULL;
-                }
-                /* There's another entry at this position. We need to wrap it in
-                 * a subnode and then add our entry in there. */
-
-                if ((level + 1) * 5 >= 64) {
-                    /* Max depth reached; no more hash bits available. TODO: Use
-                     * secondary hash function or a duplicate list (a flat array
-                     * on the deepest level). */
-                    assert(0);
-                }
-
-                /* Convert entry to subnode and clear its leaf flag. */
-                _dictWrapEntryInSubnode(d, &node->children[childindex], level+1);
-                node->leafmap &= ~(1U << childbit);
-            }
-            /* The child is a subnode. Loop to add our new key inside it. */
-            node = &node->children[childindex].sub;
-            level++;
-        } else {
-            /* Child doesn't exist. Let's make space for our entry here. */
+        if (!child_exists(node, childbit)) {
+            /* Let's make space for our entry here. */
             int numchildren = dict_popcount(node->bitmap);
             int numafter = numchildren - childindex;
             node->children = zrealloc(node->children,
@@ -393,6 +318,31 @@ dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) {
             d->size++;
             return &node->children[childindex].entry;
         }
+
+        if (child_is_entry(node, childbit)) {
+            dictEntry *entry = &node->children[childindex].entry;
+            if (dictCompareKeys(d, key, entry->key)) {
+                if (existing) *existing = entry;
+                return NULL;
+            }
+
+            /* There's another entry at this position. We need to wrap it in
+             * a subnode and then add our entry in there. */
+            if ((level + 1) * 5 >= 64) {
+                /* Max depth reached; no more hash bits available. TODO: Use
+                 * secondary hash function or a duplicate list (a flat array on
+                 * the deepest level). */
+                assert(0);
+            }
+
+            /* Convert entry to subnode and clear its leaf flag. */
+            dictWrapEntryInSubnode(d, &node->children[childindex], level+1);
+            node->leafmap &= ~(1U << childbit);
+        }
+
+        /* The child is a subnode. Loop to add our new key inside it. */
+        node = &node->children[childindex].sub;
+        level++;
     }
 }
 
@@ -494,12 +444,13 @@ static int dictDeleteFromNode(dict *d, dictSubNode *node, int level,
         *deleted = *entry;
 
         int numchildren = dict_popcount(node->bitmap);
-        int numafter = numchildren - childindex - 1;
+        numchildren--;
+        int numafter = numchildren - childindex;
         memmove(&node->children[childindex],
                 &node->children[childindex + 1],
                 sizeof(union dictNode) * numafter);
         node->children = zrealloc(node->children,
-                                  sizeof(union dictNode) * --numchildren);
+                                  sizeof(union dictNode) * numchildren);
         node->bitmap  &= ~(1U << childbit);
         node->leafmap &= ~(1U << childbit);
         return 1;
@@ -697,6 +648,7 @@ static inline uint64_t incrCursorAtLevel(uint64_t cursor, int level) {
     return cursor;
 }
 
+/* Recursive helper for dictNext(). */
 dictEntry *dictNextInNode(dictIterator *iter, dictSubNode *node, int level) {
     union dictNode *children = node->children;
     int childbit = bitindex_at_level(iter->cursor, level);
@@ -978,73 +930,60 @@ size_t dictEstimateMem(dict *d) {
 
 /* ------------------------------- Debugging ---------------------------------*/
 
-/* #define DICT_STATS_VECTLEN 50 */
-/* size_t _dictGetStatsHt(char *buf, size_t bufsize, dictht *ht, int tableid) { */
-/*     unsigned long i, slots = 0, chainlen, maxchainlen = 0; */
-/*     unsigned long totchainlen = 0; */
-/*     unsigned long clvector[DICT_STATS_VECTLEN]; */
-/*     size_t l = 0; */
-
-/*     if (ht->used == 0) { */
-/*         return snprintf(buf,bufsize, */
-/*             "No stats available for empty dictionaries\n"); */
-/*     } */
-
-/*     /\* Compute stats. *\/ */
-/*     for (i = 0; i < DICT_STATS_VECTLEN; i++) clvector[i] = 0; */
-/*     for (i = 0; i < ht->size; i++) { */
-/*         dictEntry *he; */
-
-/*         if (ht->table[i] == NULL) { */
-/*             clvector[0]++; */
-/*             continue; */
-/*         } */
-/*         slots++; */
-/*         /\* For each hash entry on this slot... *\/ */
-/*         chainlen = 0; */
-/*         he = ht->table[i]; */
-/*         while(he) { */
-/*             chainlen++; */
-/*             he = he->next; */
-/*         } */
-/*         clvector[(chainlen < DICT_STATS_VECTLEN) ? chainlen : (DICT_STATS_VECTLEN-1)]++; */
-/*         if (chainlen > maxchainlen) maxchainlen = chainlen; */
-/*         totchainlen += chainlen; */
-/*     } */
-
-/*     /\* Generate human readable stats. *\/ */
-/*     l += snprintf(buf+l,bufsize-l, */
-/*         "Hash table %d stats (%s):\n" */
-/*         " table size: %lu\n" */
-/*         " number of elements: %lu\n" */
-/*         " different slots: %lu\n" */
-/*         " max chain length: %lu\n" */
-/*         " avg chain length (counted): %.02f\n" */
-/*         " avg chain length (computed): %.02f\n" */
-/*         " Chain length distribution:\n", */
-/*         tableid, (tableid == 0) ? "main hash table" : "rehashing target", */
-/*         ht->size, ht->used, slots, maxchainlen, */
-/*         (float)totchainlen/slots, (float)ht->used/slots); */
-
-/*     for (i = 0; i < DICT_STATS_VECTLEN-1; i++) { */
-/*         if (clvector[i] == 0) continue; */
-/*         if (l >= bufsize) break; */
-/*         l += snprintf(buf+l,bufsize-l, */
-/*             "   %s%ld: %ld (%.02f%%)\n", */
-/*             (i == DICT_STATS_VECTLEN-1)?">= ":"", */
-/*             i, clvector[i], ((float)clvector[i]/ht->size)*100); */
-/*     } */
-
-/*     /\* Unlike snprintf(), return the number of characters actually written. *\/ */
-/*     if (bufsize) buf[bufsize-1] = '\0'; */
-/*     return strlen(buf); */
-/* } */
-
+/* Ideas for stats: Store the total number of subnodes in the dict. Then the
+ * total allocation size can be computed using dict size. */
 void dictGetStats(char *buf, size_t bufsize, dict *d) {
     DICT_NOTUSED(d);
     snprintf(buf, bufsize, "Stats for HAMT not implemented");
     /* Make sure there is a NULL term at the end. */
     if (bufsize) buf[bufsize-1] = '\0';
+}
+
+/* Helper for dictDump(). */
+void dictDumpSub(dictSubNode *node, int level) {
+    for (int childbit = 0; childbit < 32; childbit++) {
+        if (!child_exists(node, childbit)) continue;
+        int childindex = child_index(node, childbit);
+        if (child_is_entry(node, childbit)) {
+            dictEntry *entry = &node->children[childindex].entry;
+            printf("%*s%02d \"%s\"\n", level*3, "", childbit, (char*)entry->key);
+        } else {
+            printf("%*s%02d\n", level*3, "", childbit);
+            dictDumpSub(&node->children[childindex].sub, level + 1);
+        }
+    }
+}
+
+/* Prints a dict as a tree with node indices. Keys must be strings. */
+void dictDump(dict *d) {
+    if (d->size == 0)
+        printf("00 (empty)\n");
+    else if (d->size == 1)
+        printf("00 \"%s\"\n", (char*)d->root.entry.key);
+    else
+        dictDumpSub(&d->root.sub, 0);
+}
+
+/* Prints a cursor as a path of 5-bit indices into the tree. */
+void dictDumpCursor(uint64_t c) {
+    printf("cursor:");
+    while (c) {
+        printf("/%d", (int)(c & 0x1f));
+        c = c >> 5;
+    }
+}
+
+/* Prints all keys on a single line using an iterator. Keys must be strings. */
+void dictPrintAll(dict *d) {
+    dictIterator iter;
+    dictInitIterator(&iter, d, 0);
+    printf("Dict keys:");
+    for (;;) {
+        dictEntry *e = dictNext(&iter);
+        if (e == NULL) break;
+        printf(" %s", (char*)e->key);
+    }
+    printf("\n");
 }
 
 /* ------------------------------- Benchmark ---------------------------------*/
