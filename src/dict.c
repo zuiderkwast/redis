@@ -693,7 +693,7 @@ static inline uint64_t incrCursorAtLevel(uint64_t cursor, int level) {
             break;
         }
         /* loop to increment the level above */
-    } while(--level >= 0);
+    } while(level-- > 0);
     return cursor;
 }
 
@@ -715,14 +715,14 @@ dictEntry *dictNextInNode(dictIterator *iter, dictSubNode *node, int level) {
                 if (found) return found;
             }
         }
-        /* No more entries within child. Skip to beginning of next child. */
+        /* No more entries within child. Clear this and all sublevel indices.
+         * (At level 0 the mask is 0, at level 1 it is 0x1f, and so on.) */
+        iter->cursor &= (1ULL << (5 * level)) - 1;
+
+        /* Skip to beginning of next child. */
         if (++childbit == 32) break;
-        iter->cursor &= ~(0x1fULL << (5*level));           /* clear all bits */
         iter->cursor |= ((uint64_t)childbit << (5*level)); /* set bits */
     }
-    /* No more entries within node. Clear this and all sublevel indices. (At
-     * level 0 the mask is 0, at level 1 it is binary 11111, and so on.) */
-    iter->cursor &= (1U << (5 * level)) - 1;
     return NULL;
 }
 
