@@ -625,7 +625,7 @@ dictIterator *dictGetSafeIterator(dict *d) {
 /* Forwards a cursor to the next index on the given level. The 5-bit group
  * corresponding to the given level is incremented and all sublevels indexes are
  * cleared. If the incremented 5-bit number overflows (i.e. if it reaches 32),
- * it warps to 0 and the outer level's 5-bit group is incremented and overflow
+ * it wraps to 0 and the outer level's 5-bit group is incremented and overflow
  * on this level is handle the same way. If level 0 overflows, 0 is returned
  * (meaning that the root level has been fully scanned and there is no more to
  * scan).
@@ -695,7 +695,7 @@ dictEntry *dictNext(dictIterator *iter) {
         entry = dictNextInNode(iter, &iter->d->root.sub, 0);
     }
     if (entry == NULL) {
-        iter->d = NULL; /* Prevents it from warping. */
+        iter->d = NULL; /* Prevents it from restarting from 0. */
         iter->cursor = 0;
     }
     return entry;
@@ -721,7 +721,7 @@ dictEntry *dictGetRandomKey(dict *d)
     dictInitIterator(&iter, d, start);
     dictEntry *entry = dictNext(&iter);
     if (entry == NULL) {
-        /* warp and start from the beginning */
+        /* wrap and start from the beginning */
         dictInitIterator(&iter, d, 0);
         entry = dictNext(&iter);
         assert(entry != NULL);
@@ -759,7 +759,7 @@ unsigned int dictGetSomeKeys(dict *d, dictEntry **des, unsigned int count) {
     for (unsigned int i = 0; i < count; i++) {
         dictEntry *entry = dictNext(&iter);
         if (entry == NULL) {
-            /* warp and start from the beginning */
+            /* wrap and start from the beginning */
             dictInitIterator(&iter, d, 0);
             entry = dictNext(&iter);
             assert(entry != NULL);
