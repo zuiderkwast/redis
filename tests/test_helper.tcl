@@ -201,8 +201,13 @@ proc reconnect {args} {
 
 proc redis_deferring_client {args} {
     set level 0
+    set db 9
     if {[llength $args] > 0 && [string is integer [lindex $args 0]]} {
         set level [lindex $args 0]
+        set args [lrange $args 1 end]
+    }
+    if {[llength $args] > 0 && [string equal {noselect} [lindex $args 0]]} {
+        set db 0
         set args [lrange $args 1 end]
     }
 
@@ -210,8 +215,10 @@ proc redis_deferring_client {args} {
     set client [redis [srv $level "host"] [srv $level "port"] 1 $::tls]
 
     # select the right db and read the response (OK)
-    $client select 9
-    $client read
+    if {$db != 0} {
+        $client select $db
+        $client read
+    }
     return $client
 }
 

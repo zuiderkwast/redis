@@ -449,6 +449,14 @@ start_server {tags {"acl"}} {
         set e
     } {*NOAUTH*}
 
+    test {When default user is off, unauthenticated multibulk maxlength is 10} {
+        r ACL setuser default off
+        set rd1 [redis_deferring_client noselect]
+        catch {[$rd1 select 1 2 3 4 5 6 7 8 9 a b c d e f]} e
+        r ACL setuser default on
+        set e
+    } {*invalid*}
+
     test {When default user has no command permission, hello command still works for other users} {
         r ACL setuser secure-user >supass on +@all
         r ACL setuser default -@all
